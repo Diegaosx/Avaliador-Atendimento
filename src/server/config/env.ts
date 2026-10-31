@@ -33,13 +33,23 @@ export const env = {
   MAX_UPLOAD_SIZE_BYTES: parseNumber(process.env.MAX_UPLOAD_SIZE_BYTES, 5 * 1024 * 1024),
 
   // PostgreSQL Standard Configuration
-  POSTGRES_ENABLED: parseBoolean(process.env.POSTGRES_ENABLED, false),
-  POSTGRES_HOST: process.env.POSTGRES_HOST || 'localhost',
-  POSTGRES_PORT: parseNumber(process.env.POSTGRES_PORT, 5432),
-  POSTGRES_USER: process.env.POSTGRES_USER || 'postgres',
-  POSTGRES_PASSWORD: process.env.POSTGRES_PASSWORD || '',
-  POSTGRES_DB: process.env.POSTGRES_DB || 'kore_base',
-  POSTGRES_SSL: parseBoolean(process.env.POSTGRES_SSL, false),
+  DATABASE_URL: process.env.DATABASE_URL || process.env.POSTGRES_URL || '',
+  POSTGRES_ENABLED: parseBoolean(
+    process.env.POSTGRES_ENABLED,
+    Boolean(process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.PGHOST)
+  ),
+  POSTGRES_HOST: process.env.PGHOST || process.env.POSTGRES_HOST || 'localhost',
+  POSTGRES_PORT: parseNumber(process.env.PGPORT || process.env.POSTGRES_PORT, 5432),
+  POSTGRES_USER: process.env.PGUSER || process.env.POSTGRES_USER || 'postgres',
+  POSTGRES_PASSWORD: process.env.PGPASSWORD || process.env.POSTGRES_PASSWORD || '',
+  POSTGRES_DB: process.env.PGDATABASE || process.env.POSTGRES_DB || 'railway',
+  POSTGRES_SSL: parseBoolean(
+    process.env.POSTGRES_SSL,
+    Boolean(
+      (process.env.DATABASE_URL && !process.env.DATABASE_URL.includes('localhost')) ||
+      (process.env.PGHOST && !process.env.PGHOST.includes('localhost'))
+    )
+  ),
   POSTGRES_POOL_MAX: parseNumber(process.env.POSTGRES_POOL_MAX, 10),
 
   // Optional Redis + BullMQ Configuration

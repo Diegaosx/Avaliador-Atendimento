@@ -16,6 +16,8 @@ import {
   RankingSummary,
 } from '../../shared/types';
 import { hashPassword, verifyPassword, hashToken } from '../security/crypto-shield';
+import pg from 'pg';
+import { env } from '../config/env';
 
 export interface StoredUser extends User {
   passwordHash: string;
@@ -415,9 +417,259 @@ function createInitialSeed(): DatabaseSchemaState {
 
 class PostgresRepository {
   private state: DatabaseSchemaState;
+  private pool: pg.Pool | null = null;
+  private isPostgresActive: boolean = false;
 
   constructor() {
     this.state = this.loadOrInitialize();
+    this.initializePostgres();
+  }
+
+  public getIsPostgresConnected(): boolean {
+    return this.isPostgresActive;
+  }
+
+  private async initializePostgres() {
+    if (!env.POSTGRES_ENABLED) {
+      console.log('ℹ️ PostgreSQL desabilitado. Operando no modo embutido (.data/kore_postgres_store.json).');
+      return;
+    }
+
+    try {
+      const config: pg.PoolConfig = env.DATABASE_URL
+        ? {
+            connectionString: env.DATABASE_URL,
+            ssl: env.POSTGRES_SSL ? { rejectUnauthorized: false } : undefined,
+            max: env.POSTGRES_POOL_MAX,
+          }
+        : {
+            host: env.POSTGRES_HOST,
+            port: env.POSTGRES_PORT,
+            user: env.POSTGRES_USER,
+            password: env.POSTGRES_PASSWORD,
+            database: env.POSTGRES_DB,
+            ssl: env.POSTGRES_SSL ? { rejectUnauthorized: false } : undefined,
+            max: env.POSTGRES_POOL_MAX,
+          };
+
+      this.pool = new pg.Pool(config);
+      const client = await this.pool.connect();
+      client.release();
+      this.isPostgresActive = true;
+      console.log('✅ Conexão com PostgreSQL estabelecida com sucesso!');
+
+      await this.runPostgresMigrations();
+      await this.syncStateFromPostgres();
+    } catch (err: unknown) {
+      console.warn('⚠️ Não foi possível conectar ao PostgreSQL. Mantendo modo embutido:', (err as Error).message);
+      this.pool = null;
+      this.isPostgresActive = false;
+    }
+  }
+
+  private async runPostgresMigrations() {
+    if (!this.pool) return;
+    try {
+      await this.pool.query(`
+        CREATE TABLE IF NOT EXISTS users (
+          id VARCHAR(50) PRIMARY KEY,
+          name VARCHAR(160) NOT NULL,
+          email VARCHAR(255) NOT NULL UNIQUE,
+          password_hash TEXT NOT NULL,
+          role VARCHAR(20) NOT NULL DEFAULT 'client',
+          status VARCHAR(20) NOT NULL DEFAULT 'active',
+          locale VARCHAR(10) NOT NULL DEFAULT 'pt-BR',
+          department VARCHAR(120) NOT NULL DEFAULT 'General',
+          last_login_at TIMESTAMPTZ,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS vendedoras (
+          id VARCHAR(50) PRIMARY KEY,
+          nome VARCHAR(160) NOT NULL,
+          foto TEXT,
+          cargo VARCHAR(120),
+          loja VARCHAR(120) DEFAULT 'Loja Principal',
+          ativa BOOLEAN NOT NULL DEFAULT true,
+          criada_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS quinzenas (
+          id VARCHAR(40) PRIMARY KEY,
+          ano INTEGER NOT NULL,
+          mes INTEGER NOT NULL,
+          quinzena INTEGER NOT NULL,
+          rotulo VARCHAR(60) NOT NULL,
+          data_inicio TIMESTAMPTZ NOT NULL,
+          data_fim TIMESTAMPTZ NOT NULL,
+          premio_valor NUMERIC(10,2) NOT NULL DEFAULT 300.00,
+          status VARCHAR(20) NOT NULL DEFAULT 'aberta',
+          vencedora_id VARCHAR(50),
+          vencedora_nome VARCHAR(160),
+          vencedora_media NUMERIC(3,2),
+          vencedora_total_votos INTEGER,
+          homologado_em TIMESTAMPTZ
+        );
+
+        CREATE TABLE IF NOT EXISTS avaliacoes (
+          id VARCHAR(50) PRIMARY KEY,
+          codigo_voto VARCHAR(30) NOT NULL UNIQUE,
+          vendedora_id VARCHAR(50) NOT NULL,
+          vendedora_nome VARCHAR(160) NOT NULL,
+          sorriso INTEGER NOT NULL,
+          cordialidade INTEGER NOT NULL,
+          conhecimento INTEGER NOT NULL,
+          experiencia INTEGER NOT NULL,
+          media NUMERIC(3,2) NOT NULL,
+          cliente_nome VARCHAR(160),
+          cliente_telefone VARCHAR(40),
+          comentario TEXT,
+          quinzena_id VARCHAR(40) NOT NULL,
+          quinzena_rotulo VARCHAR(60) NOT NULL,
+          ip_address VARCHAR(64) NOT NULL,
+          criada_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          status VARCHAR(20) NOT NULL DEFAULT 'valida',
+          desqualificada_motivo TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS audit_logs (
+          id VARCHAR(50) PRIMARY KEY,
+          timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          actor_id VARCHAR(50),
+          actor_email VARCHAR(255) NOT NULL,
+          actor_role VARCHAR(32) NOT NULL,
+          action VARCHAR(120) NOT NULL,
+          category VARCHAR(32) NOT NULL,
+          resource VARCHAR(255) NOT NULL,
+          status VARCHAR(16) NOT NULL,
+          ip_address VARCHAR(64) NOT NULL,
+          latency_ms INTEGER NOT NULL DEFAULT 0,
+          metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+      `);
+      console.log('✅ Tabelas PostgreSQL migradas com sucesso.');
+    } catch (err) {
+      console.error('Erro nas migrações do PostgreSQL:', err);
+    }
+  }
+
+  private async syncStateFromPostgres() {
+    if (!this.pool) return;
+    try {
+      // 1. Sync Vendedoras
+      const resVend = await this.pool.query('SELECT * FROM vendedoras ORDER BY criada_em DESC');
+      if (resVend.rows.length === 0) {
+        for (const v of this.state.vendedoras) {
+          await this.pool.query(
+            'INSERT INTO vendedoras (id, nome, foto, cargo, loja, ativa, criada_em) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id) DO NOTHING',
+            [v.id, v.nome, v.foto, v.cargo, v.loja, v.ativa, v.criadaEm]
+          );
+        }
+      } else {
+        this.state.vendedoras = resVend.rows.map((r: any) => ({
+          id: r.id,
+          nome: r.nome,
+          foto: r.foto,
+          cargo: r.cargo,
+          loja: r.loja,
+          ativa: r.ativa,
+          criadaEm: new Date(r.criada_em).toISOString(),
+        }));
+      }
+
+      // 2. Sync Quinzenas
+      const resQnz = await this.pool.query('SELECT * FROM quinzenas ORDER BY ano DESC, mes DESC, quinzena DESC');
+      if (resQnz.rows.length === 0) {
+        for (const q of this.state.quinzenas) {
+          await this.pool.query(
+            `INSERT INTO quinzenas (id, ano, mes, quinzena, rotulo, data_inicio, data_fim, premio_valor, status, vencedora_id, vencedora_nome, vencedora_media, vencedora_total_votos, homologado_em)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (id) DO NOTHING`,
+            [q.id, q.ano, q.mes, q.quinzena, q.rotulo, q.dataInicio, q.dataFim, q.premioValor, q.status, q.vencedoraId || null, q.vencedoraNome || null, q.vencedoraMedia || null, q.vencedoraTotalVotos || null, q.homologadoEm || null]
+          );
+        }
+      } else {
+        this.state.quinzenas = resQnz.rows.map((r: any) => ({
+          id: r.id,
+          ano: r.ano,
+          mes: r.mes,
+          quinzena: r.quinzena,
+          rotulo: r.rotulo,
+          dataInicio: new Date(r.data_inicio).toISOString(),
+          dataFim: new Date(r.data_fim).toISOString(),
+          premioValor: Number(r.premio_valor),
+          status: r.status,
+          vencedoraId: r.vencedora_id || undefined,
+          vencedoraNome: r.vencedora_nome || undefined,
+          vencedoraMedia: r.vencedora_media ? Number(r.vencedora_media) : undefined,
+          vencedoraTotalVotos: r.vencedora_total_votos ? Number(r.vencedora_total_votos) : undefined,
+          homologadoEm: r.homologado_em ? new Date(r.homologado_em).toISOString() : undefined,
+        }));
+      }
+
+      // 3. Sync Avaliacoes
+      const resAvl = await this.pool.query('SELECT * FROM avaliacoes ORDER BY criada_em DESC');
+      if (resAvl.rows.length === 0) {
+        for (const a of this.state.avaliacoes) {
+          await this.pool.query(
+            `INSERT INTO avaliacoes (id, codigo_voto, vendedora_id, vendedora_nome, sorriso, cordialidade, conhecimento, experiencia, media, cliente_nome, cliente_telefone, comentario, quinzena_id, quinzena_rotulo, ip_address, criada_em, status, desqualificada_motivo)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) ON CONFLICT (id) DO NOTHING`,
+            [a.id, a.codigoVoto, a.vendedoraId, a.vendedoraNome, a.sorriso, a.cordialidade, a.conhecimento, a.experiencia, a.media, a.clienteNome || null, a.clienteTelefone || null, a.comentario || null, a.quinzenaId, a.quinzenaRotulo, a.ipAddress, a.criadaEm, a.status, a.desqualificadaMotivo || null]
+          );
+        }
+      } else {
+        this.state.avaliacoes = resAvl.rows.map((r: any) => ({
+          id: r.id,
+          codigoVoto: r.codigo_voto,
+          vendedoraId: r.vendedora_id,
+          vendedoraNome: r.vendedora_nome,
+          sorriso: r.sorriso,
+          cordialidade: r.cordialidade,
+          conhecimento: r.conhecimento,
+          experiencia: r.experiencia,
+          media: Number(r.media),
+          clienteNome: r.cliente_nome || undefined,
+          clienteTelefone: r.cliente_telefone || undefined,
+          comentario: r.comentario || undefined,
+          quinzenaId: r.quinzena_id,
+          quinzenaRotulo: r.quinzena_rotulo,
+          ipAddress: r.ip_address,
+          criadaEm: new Date(r.criada_em).toISOString(),
+          status: r.status,
+          desqualificadaMotivo: r.desqualificada_motivo || undefined,
+        }));
+      }
+
+      // 4. Sync Users
+      const resUsr = await this.pool.query('SELECT * FROM users');
+      if (resUsr.rows.length === 0) {
+        for (const u of this.state.users) {
+          await this.pool.query(
+            `INSERT INTO users (id, name, email, password_hash, role, status, locale, department, last_login_at, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (id) DO NOTHING`,
+            [u.id, u.name, u.email, u.passwordHash, u.role, u.status, u.locale, u.department, u.lastLoginAt, u.createdAt, u.updatedAt]
+          );
+        }
+      } else {
+        this.state.users = resUsr.rows.map((r: any) => ({
+          id: r.id,
+          name: r.name,
+          email: r.email,
+          passwordHash: r.password_hash,
+          role: r.role,
+          status: r.status,
+          locale: r.locale,
+          department: r.department,
+          lastLoginAt: r.last_login_at ? new Date(r.last_login_at).toISOString() : null,
+          createdAt: new Date(r.created_at).toISOString(),
+          updatedAt: new Date(r.updated_at).toISOString(),
+        }));
+      }
+      this.persist();
+      console.log('✅ Estado sincronizado com o PostgreSQL.');
+    } catch (err) {
+      console.error('Erro ao sincronizar com PostgreSQL:', err);
+    }
   }
 
   private loadOrInitialize(): DatabaseSchemaState {
@@ -648,6 +900,30 @@ class PostgresRepository {
     }
     this.incrementTodayMetric('actionsCount');
     this.persist();
+
+    if (this.pool && this.isPostgresActive) {
+      this.pool
+        .query(
+          `INSERT INTO audit_logs (id, timestamp, actor_id, actor_email, actor_role, action, category, resource, status, ip_address, latency_ms, metadata)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+          [
+            fullLog.id,
+            fullLog.timestamp,
+            fullLog.actorId || null,
+            fullLog.actorEmail,
+            fullLog.actorRole,
+            fullLog.action,
+            fullLog.category,
+            fullLog.resource,
+            fullLog.status,
+            fullLog.ipAddress,
+            fullLog.latencyMs,
+            JSON.stringify(fullLog.metadata || {}),
+          ]
+        )
+        .catch((err) => console.error('Erro ao gravar audit log no PostgreSQL:', err));
+    }
+
     return fullLog;
   }
 
@@ -743,6 +1019,16 @@ class PostgresRepository {
 
     this.state.vendedoras.unshift(vendedora);
     this.persist();
+
+    if (this.pool && this.isPostgresActive) {
+      this.pool
+        .query(
+          `INSERT INTO vendedoras (id, nome, foto, cargo, loja, ativa, criada_em) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [vendedora.id, vendedora.nome, vendedora.foto, vendedora.cargo, vendedora.loja, vendedora.ativa, vendedora.criadaEm]
+        )
+        .catch((err) => console.error('Erro ao persistir vendedora no PostgreSQL:', err));
+    }
+
     return vendedora;
   }
 
@@ -757,6 +1043,16 @@ class PostgresRepository {
     if (updates.loja !== undefined) item.loja = updates.loja.trim();
     if (updates.ativa !== undefined) item.ativa = updates.ativa;
     this.persist();
+
+    if (this.pool && this.isPostgresActive) {
+      this.pool
+        .query(
+          `UPDATE vendedoras SET nome = $1, foto = $2, cargo = $3, loja = $4, ativa = $5 WHERE id = $6`,
+          [item.nome, item.foto, item.cargo, item.loja, item.ativa, item.id]
+        )
+        .catch((err) => console.error('Erro ao atualizar vendedora no PostgreSQL:', err));
+    }
+
     return item;
   }
 
@@ -765,6 +1061,13 @@ class PostgresRepository {
     if (idx === -1) return false;
     this.state.vendedoras.splice(idx, 1);
     this.persist();
+
+    if (this.pool && this.isPostgresActive) {
+      this.pool
+        .query(`DELETE FROM vendedoras WHERE id = $1`, [id])
+        .catch((err) => console.error('Erro ao deletar vendedora no PostgreSQL:', err));
+    }
+
     return true;
   }
 
@@ -842,6 +1145,26 @@ class PostgresRepository {
     });
 
     this.persist();
+
+    if (this.pool && this.isPostgresActive) {
+      this.pool
+        .query(
+          `UPDATE quinzenas
+           SET status = $1, homologado_em = $2, vencedora_id = $3, vencedora_nome = $4, vencedora_media = $5, vencedora_total_votos = $6
+           WHERE id = $7`,
+          [
+            quinzena.status,
+            quinzena.homologadoEm,
+            quinzena.vencedoraId || null,
+            quinzena.vencedoraNome || null,
+            quinzena.vencedoraMedia || null,
+            quinzena.vencedoraTotalVotos || null,
+            quinzena.id,
+          ]
+        )
+        .catch((err) => console.error('Erro ao atualizar quinzena no PostgreSQL:', err));
+    }
+
     return quinzena;
   }
 
@@ -912,6 +1235,35 @@ class PostgresRepository {
     this.state.avaliacoes.unshift(novaAvaliacao);
     this.incrementTodayMetric('actionsCount');
     this.persist();
+
+    if (this.pool && this.isPostgresActive) {
+      this.pool
+        .query(
+          `INSERT INTO avaliacoes (id, codigo_voto, vendedora_id, vendedora_nome, sorriso, cordialidade, conhecimento, experiencia, media, cliente_nome, cliente_telefone, comentario, quinzena_id, quinzena_rotulo, ip_address, criada_em, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+          [
+            novaAvaliacao.id,
+            novaAvaliacao.codigoVoto,
+            novaAvaliacao.vendedoraId,
+            novaAvaliacao.vendedoraNome,
+            novaAvaliacao.sorriso,
+            novaAvaliacao.cordialidade,
+            novaAvaliacao.conhecimento,
+            novaAvaliacao.experiencia,
+            novaAvaliacao.media,
+            novaAvaliacao.clienteNome || null,
+            novaAvaliacao.clienteTelefone || null,
+            novaAvaliacao.comentario || null,
+            novaAvaliacao.quinzenaId,
+            novaAvaliacao.quinzenaRotulo,
+            novaAvaliacao.ipAddress,
+            novaAvaliacao.criadaEm,
+            novaAvaliacao.status,
+          ]
+        )
+        .catch((err) => console.error('Erro ao persistir avaliação no PostgreSQL:', err));
+    }
+
     return novaAvaliacao;
   }
 
@@ -968,6 +1320,16 @@ class PostgresRepository {
       metadata: { avaliacaoId: id, codigoVoto: avl.codigoVoto, motivo },
     });
     this.persist();
+
+    if (this.pool && this.isPostgresActive) {
+      this.pool
+        .query(
+          `UPDATE avaliacoes SET status = $1, desqualificada_motivo = $2 WHERE id = $3`,
+          [avl.status, avl.desqualificadaMotivo, avl.id]
+        )
+        .catch((err) => console.error('Erro ao atualizar status de avaliação no PostgreSQL:', err));
+    }
+
     return avl;
   }
 
